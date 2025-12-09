@@ -45,8 +45,8 @@ Google MediaPipe Hands
 
 HTML5 Canvas API
 
-🚀 在线体验 (Demo)
+🚀 在线体验 
 
-点击这里体验 Live Demo
+点击这里体验 https://blitzkid007.github.io/Gesture-drawing-and-interaction-system-/
 
 Created with ❤️ by [Barron T  李]
