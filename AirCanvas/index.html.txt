@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 纯净空中画板 - 原始比例版</title>
+    <!-- 引入 MediaPipe -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils@0.6/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #111; font-family: 'Segoe UI', sans-serif; }
+        
+        /* 隐藏原始视频元素 */
+        #input_video { display: none; }
+        
+        /* 画布全屏，并进行水平镜像翻转，实现“照镜子”体验 */
+        #output_canvas {
+            position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+            z-index: 1;
+            transform: scaleX(-1); 
+        }
+
+        /* 状态提示 */
+        #status_indicator {
+            position: absolute; top: 20px; left: 20px; z-index: 10;
+            padding: 8px 16px; background: rgba(0,0,0,0.6); color: rgba(255,255,255,0.9);
+            border-radius: 20px; font-size: 14px; font-weight: 500; pointer-events: none;
+            backdrop-filter: blur(4px);
+        }
+
+        /* 极简 UI 工具栏 */
+        #ui_layer {
+            position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
+            z-index: 10; display: flex; gap: 15px; padding: 10px 25px;
+            background: rgba(30, 30, 30, 0.85); /* 深色磨砂风格 */
+            border-radius: 60px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.1);
+            align-items: center; justify-content: center;
+        }
+
+        .tool-btn {
+            width: 50px; height: 50px; border-radius: 50%; border: 2px solid transparent;
+            cursor: pointer; display: flex; justify-content: center; align-items: center;
+            font-size: 22px; background-color: rgba(255,255,255,0.1); color: white; transition: all 0.2s;
+        }
+        
+        .tool-btn:hover { background-color: rgba(255,255,255,0.2); }
+        .tool-btn.active { transform: scale(1.1); border-color: #00e5ff; background-color: rgba(0, 229, 255, 0.2); color: #00e5ff; box-shadow: 0 0 15px rgba(0, 229, 255, 0.3); }
+
+        .divider { width: 1px; height: 25px; background: rgba(255,255,255,0.2); margin: 0 5px; }
+
+        .color-btn { width: 32px; height: 32px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.5); cursor: pointer; transition: transform 0.2s; }
+        .color-btn.active { transform: scale(1.3); border-color: white; box-shadow: 0 0 10px rgba(255,255,255,0.5); }
+        
+        /* 清空按钮 */
+        .tool-btn.clear-btn { color: #ff5252; }
+        .tool-btn.clear-btn:hover { background-color: rgba(255, 82, 82, 0.2); }
+
+    </style>
+</head>
+<body>
+
+    <video id="input_video"></video>
+    <canvas id="output_canvas"></canvas>
+    
+    <div id="status_indicator">正在校准摄像头...</div>
+
+    <div id="ui_layer">
+        <div class="tool-btn active" id="btn-brush" data-tool="brush" title="画笔">🖌️</div>
+        <div class="tool-btn" id="btn-eraser" data-tool="eraser" title="橡皮擦 (触碰即消)">⚡</div>
+        <div class="tool-btn clear-btn" id="btn-clear" data-tool="clear" title="清空画板">🗑️</div>
+        
+        <div class="divider"></div>
+        
+        <div class="color-btn active" style="background: #ffffff;" data-color="#ffffff"></div>
+        <div class="color-btn" style="background: #ff4081;" data-color="#ff4081"></div>
+        <div class="color-btn" style="background: #00e5ff;" data-color="#00e5ff"></div>
+        <div class="color-btn" style="background: #76ff03;" data-color="#76ff03"></div>
+        <div class="color-btn" style="background: #ffd740;" data-color="#ffd740"></div>
+    </div>
+
+<script>
+    const videoElement = document.getElementById('input_video');
+    const canvasElement = document.getElementById('output_canvas');
+    const ctx = canvasElement.getContext('2d');
+    const statusDiv = document.getElementById('status_indicator');
+    
+    // 初始化画布尺寸
+    let screenW = window.innerWidth;
+    let screenH = window.innerHeight;
+    canvasElement.width = screenW;
+    canvasElement.height = screenH;
+
+    // --- 核心状态 ---
+    const STATE = {
+        tool: 'brush', 
+        color: '#ffffff',
+        baseSize: 10, 
+        isDrawing: false,
+        strokes: [], // 笔画数据
+        
+        // 平滑坐标
+        smoothedX: 0,
+        smoothedY: 0,
+        
+        // 画面适配参数 (用于解决拉伸问题)
+        videoLayout: { x: 0, y: 0, w: 0, h: 0 }
+    };
+
+    // --- MediaPipe Hands ---
+    const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/${file}`});
+    hands.setOptions({
+        maxNumHands: 1, // 纯净模式单手即可
+        modelComplexity: 1,
+        minDetectionConfidence: 0.7,
+        minTrackingConfidence: 0.7
+    });
+    hands.onResults(onResults);
+
+    const camera = new Camera(videoElement, {
+        onFrame: async () => { await hands.send({image: videoElement}); },
+        width: 1280, height: 720
+    });
+    camera.start();
+
+    // --- 几何工具函数 ---
+    function dist(p1, p2) { return Math.hypot(p1.x - p2.x, p1.y - p2.y); }
+    function mid(p1, p2) { return { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 }; }
+    function lerp(start, end, amt) { return (1 - amt) * start + amt * end; }
+
+    // 手势迟滞逻辑 (防抖)
+    const PINCH_START = 0.035; 
+    const PINCH_STOP = 0.06; 
+    function detectPinch(landmarks, isCurrentlyPinching) {
+        const d = dist(landmarks[4], landmarks[8]);
+        return isCurrentlyPinching ? (d < PINCH_STOP) : (d < PINCH_START);
+    }
+
+    // --- 核心逻辑：画面适配与绘制 ---
+
+    function calculateVideoLayout(videoWidth, videoHeight) {
+        // 目标：Object-Fit: Cover (填满屏幕，保持比例，裁切多余)
+        const screenAspect = screenW / screenH;
+        const videoAspect = videoWidth / videoHeight;
+        
+        let drawW, drawH, startX, startY;
+
+        if (screenAspect > videoAspect) {
+            // 屏幕更宽，以宽度为基准，裁切上下
+            drawW = screenW;
+            drawH = screenW / videoAspect;
+            startX = 0;
+            startY = (screenH - drawH) / 2; // 居中
+        } else {
+            // 屏幕更高，以高度为基准，裁切左右
+            drawH = screenH;
+            drawW = screenH * videoAspect;
+            startX = (screenW - drawW) / 2; // 居中
+            startY = 0;
+        }
+        
+        return { x: startX, y: startY, w: drawW, h: drawH };
+    }
+
+    // 将 MediaPipe 的归一化坐标 (0-1) 映射到 裁切后的画布坐标
+    function mapCoordinates(normX, normY) {
+        const layout = STATE.videoLayout;
+        return {
+            x: layout.x + normX * layout.w,
+            y: layout.y + normY * layout.h
+        };
+    }
+
+    function onResults(results) {
+        // 1. 计算适配尺寸 (每帧计算以防窗口变化，实际可优化)
+        STATE.videoLayout = calculateVideoLayout(results.image.width, results.image.height);
+        
+        // 2. 绘制视频背景 (不变形)
+        ctx.clearRect(0, 0, screenW, screenH);
+        ctx.drawImage(results.image, STATE.videoLayout.x, STATE.videoLayout.y, STATE.videoLayout.w, STATE.videoLayout.h);
+
+        // 3. 绘制笔画
+        drawAllStrokes(ctx);
+
+        // 4. 手势处理
+        if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+            statusDiv.innerText = "未检测到手部";
+            STATE.isDrawing = false;
+            return;
+        }
+
+        const hand = results.multiHandLandmarks[0];
+        
+        // 计算捏合中点 (归一化坐标)
+        const rawP = mid(hand[4], hand[8]);
+        
+        // 映射到屏幕坐标 (解决拉伸问题的关键)
+        const mappedP = mapCoordinates(rawP.x, rawP.y);
+        
+        // 坐标平滑
+        if (STATE.smoothedX === 0) { STATE.smoothedX = mappedP.x; STATE.smoothedY = mappedP.y; }
+        else {
+            STATE.smoothedX = lerp(STATE.smoothedX, mappedP.x, 0.4); // 0.4 延迟系数，越小越平滑
+            STATE.smoothedY = lerp(STATE.smoothedY, mappedP.y, 0.4);
+        }
+        
+        const cursorPt = { x: STATE.smoothedX, y: STATE.smoothedY };
+
+        // UI 交互检测 (注意：Canvas CSS 做了 scaleX(-1) 翻转)
+        // 视觉上的左边是物理屏幕的左边，但在 flipped canvas 里坐标是 (width - x)
+        const visualX = screenW - cursorPt.x;
+        
+        const isPinching = detectPinch(hand, STATE.isDrawing);
+        checkUIInteraction(visualX, cursorPt.y, isPinching);
+
+        if (isPinching) {
+            if (STATE.tool === 'brush') {
+                statusDiv.innerText = "✍️ 书写中...";
+                drawBrushCursor(cursorPt, STATE.color, STATE.baseSize);
+                handlePainting(cursorPt);
+            } else if (STATE.tool === 'eraser') {
+                statusDiv.innerText = "⚡ 橡皮擦";
+                drawEraserCursor(cursorPt);
+                handleErasing(cursorPt);
+            }
+            STATE.isDrawing = true;
+        } else {
+            statusDiv.innerText = "👆 准备中 (捏合手指书写)";
+            // 绘制引导光标
+            // 同样需要映射食指位置
+            const indexTip = mapCoordinates(hand[8].x, hand[8].y);
+            drawCursor(indexTip, 'rgba(255,255,255,0.8)');
+            STATE.isDrawing = false;
+            STATE.activeStroke = null;
+        }
+    }
+
+    // --- 笔画逻辑 ---
+
+    function handlePainting(pt) {
+        if (!STATE.isDrawing || !STATE.activeStroke) {
+            STATE.activeStroke = {
+                points: [{x: pt.x, y: pt.y, w: STATE.baseSize}],
+                color: STATE.color,
+                // 包围盒用于橡皮擦快速检测
+                bounds: { minX: pt.x, maxX: pt.x, minY: pt.y, maxY: pt.y }
+            };
+            STATE.strokes.push(STATE.activeStroke);
+        } else {
+            const points = STATE.activeStroke.points;
+            const lastPt = points[points.length - 1];
+            const d = dist(pt, lastPt);
+            
+            if (d > 2) { // 过滤微小移动
+                // 动态粗细：速度越快越细
+                const speed = Math.min(d, 20);
+                const newWidth = Math.max(STATE.baseSize * (1 - speed/40), 2);
+                
+                // 宽度平滑
+                const smoothWidth = lerp(lastPt.w, newWidth, 0.2);
+                
+                const newPt = { x: pt.x, y: pt.y, w: smoothWidth };
+                points.push(newPt);
+                
+                // 更新包围盒
+                const b = STATE.activeStroke.bounds;
+                b.minX = Math.min(b.minX, pt.x); b.maxX = Math.max(b.maxX, pt.x);
+                b.minY = Math.min(b.minY, pt.y); b.maxY = Math.max(b.maxY, pt.y);
+            }
+        }
+    }
+
+    function handleErasing(pt) {
+        // 对象擦除：碰撞检测
+        for (let i = STATE.strokes.length - 1; i >= 0; i--) {
+            const s = STATE.strokes[i];
+            // 1. 包围盒预检
+            if (pt.x < s.bounds.minX - 20 || pt.x > s.bounds.maxX + 20 ||
+                pt.y < s.bounds.minY - 20 || pt.y > s.bounds.maxY + 20) continue;
+            
+            // 2. 逐点检测
+            for (let p of s.points) {
+                if (dist(pt, p) < 20) {
+                    STATE.strokes.splice(i, 1); // 删除整条
+                    return;
+                }
+            }
+        }
+    }
+
+    function drawAllStrokes(ctx) {
+        STATE.strokes.forEach(stroke => {
+            const pts = stroke.points;
+            if (pts.length < 2) return;
+
+            ctx.beginPath();
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.strokeStyle = stroke.color;
+            ctx.lineWidth = pts[0].w; // 使用首点宽度，实际上贝塞尔曲线难以完美变宽，这里取近似
+
+            ctx.moveTo(pts[0].x, pts[0].y);
+            
+            // 二次贝塞尔曲线平滑
+            for (let i = 1; i < pts.length - 2; i++) {
+                const xc = (pts[i].x + pts[i+1].x) / 2;
+                const yc = (pts[i].y + pts[i+1].y) / 2;
+                ctx.quadraticCurveTo(pts[i].x, pts[i].y, xc, yc);
+            }
+            // 处理最后一段
+            if (pts.length > 2) {
+                const last = pts[pts.length-1];
+                const prev = pts[pts.length-2];
+                ctx.quadraticCurveTo(prev.x, prev.y, last.x, last.y);
+            }
+            ctx.stroke();
+            
+            // 可选：如果想要更好的变宽效果，可以取消上面的 stroke，改用密集画圆，但这会消耗更多性能
+            // 鉴于要求“平滑”，贝塞尔曲线是最佳选择。
+        });
+    }
+
+    // --- UI 交互 ---
+    let lastClickTime = 0;
+    function checkUIInteraction(visualX, visualY, isPinching) {
+        if (!isPinching) return;
+        const now = Date.now();
+        if (now - lastClickTime < 500) return;
+
+        const buttons = document.querySelectorAll('.tool-btn, .color-btn');
+        buttons.forEach(btn => {
+            const rect = btn.getBoundingClientRect();
+            if (visualX >= rect.left && visualX <= rect.right && visualY >= rect.top && visualY <= rect.bottom) {
+                
+                if (btn.dataset.tool) {
+                    const tool = btn.dataset.tool;
+                    if (tool === 'clear') {
+                        STATE.strokes = [];
+                        statusDiv.innerText = "画板已清空";
+                    } else {
+                        STATE.tool = tool;
+                        document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
+                        btn.classList.add('active');
+                    }
+                } else if (btn.dataset.color) {
+                    STATE.color = btn.dataset.color;
+                    STATE.tool = 'brush';
+                    document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
+                    document.getElementById('btn-brush').classList.add('active');
+                }
+                lastClickTime = now;
+            }
+        });
+    }
+
+    // --- 光标绘制 ---
+    function drawCursor(pt, color) {
+        ctx.beginPath(); ctx.arc(pt.x, pt.y, 6, 0, Math.PI*2);
+        ctx.fillStyle = color; ctx.fill(); 
+        ctx.strokeStyle = 'rgba(0,0,0,0.3)'; ctx.lineWidth = 1; ctx.stroke();
+    }
+    function drawBrushCursor(pt, color, size) {
+        ctx.beginPath(); ctx.arc(pt.x, pt.y, size/2, 0, Math.PI*2);
+        ctx.fillStyle = color; ctx.globalAlpha = 0.8; ctx.fill();
+        ctx.globalAlpha = 1; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+    }
+    function drawEraserCursor(pt) {
+        ctx.beginPath(); ctx.arc(pt.x, pt.y, 15, 0, Math.PI*2);
+        ctx.strokeStyle = '#ff5252'; ctx.lineWidth = 2; ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(pt.x-8, pt.y-8); ctx.lineTo(pt.x+8, pt.y+8); ctx.stroke();
+        ctx.moveTo(pt.x+8, pt.y-8); ctx.lineTo(pt.x-8, pt.y+8); ctx.stroke();
+    }
+
+    // 窗口大小改变时重置
+    window.addEventListener('resize', () => {
+        screenW = window.innerWidth;
+        screenH = window.innerHeight;
+        canvasElement.width = screenW;
+        canvasElement.height = screenH;
+    });
+
+</script>
+</body>
+</html>
